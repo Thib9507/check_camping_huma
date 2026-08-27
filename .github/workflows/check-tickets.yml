@@ -1,0 +1,41 @@
+name: Vérifier disponibilité billets
+
+on:
+  schedule:
+    # Toutes les 10 minutes. GitHub peut retarder l'exécution de quelques
+    # minutes en période de forte charge sur la plateforme (limitation connue
+    # des workflows planifiés, pas un bug de ce script).
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # permet de lancer le check manuellement depuis l'onglet Actions
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du repo
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      # La clé doit être unique à chaque run : actions/cache ne ré-enregistre
+      # PAS le cache quand la clé correspond exactement à un cache existant.
+      # Avec une clé fixe, last_hash.txt resterait figé sur la valeur du tout
+      # premier run, et on recevrait une notif à chaque exécution.
+      - name: Restaurer le hash précédent (cache)
+        uses: actions/cache@v4
+        with:
+          path: last_hash.txt
+          key: ticket-hash-${{ github.run_id }}
+          restore-keys: |
+            ticket-hash-
+
+      - name: Lancer la vérification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python check_tickets.py
