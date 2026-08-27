@@ -13,29 +13,47 @@ billets en revente pour une catégorie. C'est le champ dont le site lui-même
 se sert pour afficher soit un lien cliquable (nbTicket > 0), soit une cloche
 "créer une alerte" (nbTicket == 0).
 
+Pourquoi une boucle interne :
+Le cron de GitHub Actions ne descend pas sous 5 minutes, et les runs
+planifiés sont en pratique retardés bien au-delà. Un seul run qui interroge
+l'API en boucle donne une cadence réelle de l'ordre de la minute, sans
+dépendre de la ponctualité du planificateur.
+
 Anti-spam : on ne notifie qu'au passage de 0 (ou état inconnu) vers > 0.
 Tant que des places restent en ligne, on reste silencieux ; on re-notifiera
 si tout repart à 0 puis qu'une nouvelle place apparaît. Le compteur est
 conservé entre les runs dans `last_count.txt` via le cache GitHub Actions.
 
 Variables d'environnement :
-- NTFY_TOPIC  : nom du topic ntfy.sh (obligatoire pour recevoir la notif)
-- CATEGORY_ID : id de la catégorie surveillée (défaut : 8137 = CAMPING)
+- NTFY_TOPIC   : nom du topic ntfy.sh (obligatoire pour recevoir la notif)
+- CATEGORY_ID  : id de la catégorie surveillée (défaut : 8137 = CAMPING)
+- POLL_SECONDS : intervalle entre deux vérifications (défaut : 60)
+- LOOP_MINUTES : durée totale de la boucle (défaut : 15, 0 = un seul passage)
 """
 
 import os
+import random
 import re
 import sys
+import time
 import unicodedata
 
 import requests
 
 CATEGORY_ID = os.environ.get("CATEGORY_ID", "8137")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "60"))
+LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "15"))
 
 API_URL = f"https://resell.seetickets.com/api/categories/{CATEGORY_ID}"
 SITE_URL = "https://resell.seetickets.com/fete-de-lhumanite-2026/"
 STATE_FILE = "last_count.txt"
+
+# Codes qui signifient "tu insistes trop" : on recule au lieu de réessayer
+# tout de suite. C'est ça qui évite le bannissement, bien plus que le choix
+# de l'intervalle de polling.
+THROTTLE_CODES = {403, 429, 503}
+MAX_CONSECUTIVE_BLOCKS = 3
 
 HEADERS = {
     "User-Agent": (
@@ -44,6 +62,11 @@ HEADERS = {
     ),
     "Accept": "application/json",
 }
+
+# Une seule connexion TCP réutilisée pour toute la boucle : plus rapide, et
+# une poignée de main TLS en moins par vérification côté serveur.
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 
 def slugify(value: str) -> str:
@@ -58,7 +81,7 @@ def slugify(value: str) -> str:
 
 
 def fetch_category() -> dict:
-    resp = requests.get(API_URL, headers=HEADERS, timeout=20)
+    resp = SESSION.get(API_URL, timeout=20)
     resp.raise_for_status()
     return resp.json()
 
@@ -97,7 +120,7 @@ def build_ticket_url(name: str) -> str:
     """
     url = f"{SITE_URL}category/{CATEGORY_ID}/{slugify(name)}"
     try:
-        if requests.get(url, headers=HEADERS, timeout=10).status_code == 200:
+        if SESSION.get(url, timeout=10).status_code == 200:
             return url
     except requests.RequestException:
         pass
@@ -110,9 +133,7 @@ def send_notification(count: int, url: str):
         return
 
     places = "place" if count == 1 else "places"
-    message = (
-        f"{count} {places} de camping en revente. Fonce, ça part vite !"
-    )
+    message = f"{count} {places} de camping en revente. Fonce, ça part vite !"
     requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
@@ -134,7 +155,7 @@ def load_previous_count() -> int | None:
     try:
         return int(content)
     except ValueError:
-        # Fichier de cache corrompu ou hérité de l'ancienne version (hash) :
+        # Fichier de cache corrompu ou hérité d'une version précédente :
         # on repart de zéro plutôt que de planter.
         return None
 
@@ -144,38 +165,81 @@ def save_count(count: int):
         f.write(str(count))
 
 
-def main():
-    try:
-        category = fetch_category()
-    except requests.HTTPError as e:
-        # L'API ne connaît plus cette catégorie : le script ne peut plus rien
-        # détecter. On fait échouer le job pour que le run passe au rouge
-        # dans l'onglet Actions plutôt que de rester vert sans rien faire.
-        print(f"Catégorie {CATEGORY_ID} injoignable ({e}).", file=sys.stderr)
-        sys.exit(1)
-    except (requests.RequestException, ValueError) as e:
-        # Timeout, coupure réseau, 5xx passager, JSON invalide : sans gravité.
-        print(f"Erreur ponctuelle : {e}", file=sys.stderr)
-        sys.exit(0)
-
+def check_once(previous: int | None) -> int:
+    """Une vérification. Renvoie le compteur observé."""
+    category = fetch_category()
     name = category_name(category)
     check_is_camping(name)
 
     count = category.get("nbTicket") or 0
-    previous = load_previous_count()
-    print(f"{name} : nbTicket={count} (précédent : {previous})")
+    stamp = time.strftime("%H:%M:%S")
 
     if count > 0 and not previous:
         # `not previous` couvre 0 et None (premier run ou cache expiré) : on
         # préfère une notif de trop qu'une place manquée.
-        print("Des places sont disponibles, envoi de la notification.")
+        print(f"[{stamp}] {count} place(s) ! Envoi de la notification.")
         send_notification(count, build_ticket_url(name))
     elif count > 0:
-        print("Places toujours en ligne, déjà notifié.")
+        print(f"[{stamp}] {count} place(s), déjà notifié.")
     else:
-        print("Aucune place de camping en revente.")
+        print(f"[{stamp}] aucune place.")
 
     save_count(count)
+    return count
+
+
+def main():
+    previous = load_previous_count()
+    print(
+        f"Catégorie {CATEGORY_ID} | compteur précédent : {previous} | "
+        f"1 vérification toutes les {POLL_SECONDS:.0f}s pendant "
+        f"{LOOP_MINUTES:.0f} min"
+    )
+
+    deadline = time.monotonic() + LOOP_MINUTES * 60
+    blocks = 0
+
+    while True:
+        try:
+            previous = check_once(previous)
+            blocks = 0
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in THROTTLE_CODES:
+                blocks += 1
+                if blocks >= MAX_CONSECUTIVE_BLOCKS:
+                    print(
+                        f"{blocks} refus consécutifs ({status}) : on arrête "
+                        f"là pour ne pas insister.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                # Recul exponentiel : 2 min, puis 4 min.
+                backoff = 120 * 2 ** (blocks - 1)
+                print(
+                    f"Refus {status}, pause de {backoff}s avant de réessayer.",
+                    file=sys.stderr,
+                )
+                time.sleep(backoff)
+                continue
+            # 404/410 : l'API ne connaît plus cette catégorie, le script ne
+            # peut plus rien détecter. On fait échouer le job pour que le run
+            # passe au rouge plutôt que de rester vert sans rien faire.
+            print(f"Catégorie {CATEGORY_ID} injoignable ({e}).", file=sys.stderr)
+            sys.exit(1)
+        except (requests.RequestException, ValueError) as e:
+            # Timeout, coupure réseau, JSON invalide : sans gravité, on
+            # retentera au prochain passage.
+            print(f"Erreur ponctuelle : {e}", file=sys.stderr)
+
+        # On ne démarre pas une attente qui dépasserait la fin prévue.
+        if time.monotonic() + POLL_SECONDS > deadline:
+            break
+        # Un peu de jitter pour ne pas taper pile sur la seconde ronde à
+        # chaque fois, comme le ferait un script.
+        time.sleep(POLL_SECONDS + random.uniform(0, 5))
+
+    print("Fin de la boucle.")
 
 
 if __name__ == "__main__":

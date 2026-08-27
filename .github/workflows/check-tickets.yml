@@ -2,15 +2,25 @@ name: Vérifier disponibilité billets
 
 on:
   schedule:
-    # Toutes les 10 minutes. GitHub peut retarder l'exécution de quelques
-    # minutes en période de forte charge sur la plateforme (limitation connue
-    # des workflows planifiés, pas un bug de ce script).
-    - cron: "*/10 * * * *"
+    # 5 minutes est le plancher accepté par GitHub, et en pratique les runs
+    # planifiés sont retardés bien au-delà. Ce cron ne fixe donc pas la
+    # cadence réelle : c'est la boucle interne du script (POLL_SECONDS) qui
+    # la fixe. Le cron sert surtout à relancer la boucle quand elle se
+    # termine, ou à la redémarrer si GitHub en a sauté une.
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}  # permet de lancer le check manuellement depuis l'onglet Actions
+
+# Un seul run à la fois : sans ça, chaque déclenchement du cron empilerait
+# une boucle supplémentaire et on interrogerait le site en double.
+concurrency:
+  group: veille-camping
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Garde-fou : si la boucle partait en vrille, le job est coupé net.
+    timeout-minutes: 20
     steps:
       - name: Checkout du repo
         uses: actions/checkout@v4
@@ -38,4 +48,6 @@ jobs:
       - name: Lancer la vérification
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          POLL_SECONDS: "60"
+          LOOP_MINUTES: "15"
         run: python check_tickets.py
