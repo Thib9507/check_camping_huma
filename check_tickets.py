@@ -1,156 +1,181 @@
 #!/usr/bin/env python3
 """
-Surveille la page de revente SeeTickets de la Fête de l'Humanité et envoie
-une notification push (via ntfy.sh) dès que le contenu de la page change
-(signe potentiel qu'une offre est apparue).
+Surveille les billets CAMPING en revente sur le site officiel SeeTickets de
+la Fête de l'Humanité et envoie une notification push (via ntfy.sh) dès
+qu'au moins une place est mise en vente.
 
-Fonctionnement :
-- On télécharge la page.
-- On isole la zone de contenu utile (on retire les parties qui changent
-  tout le temps sans rapport avec les billets : cookies, timestamps, etc.)
-- On calcule une empreinte (hash) de ce contenu.
-- On compare ce hash à celui de la dernière exécution (stocké dans un
-  fichier `last_hash.txt`, conservé entre les runs via le cache GitHub Actions).
-- Si le hash a changé -> on envoie une notif push avec un lien direct.
-- On ajoute aussi une détection par mots-clés simples (ex: présence du mot
-  "Ajouter" ou d'un prix en €) pour donner un indice dans la notif.
+Pourquoi on n'analyse pas la page HTML :
+La liste des offres n'est pas dans le HTML servi par le serveur. La page ne
+contient qu'un composant JS (<post-events-pagination>) qui appelle ensuite
+l'API. Hasher le HTML ne verrait donc jamais l'apparition d'une offre.
+On interroge directement cette API, qui expose `nbTicket` : le nombre de
+billets en revente pour une catégorie. C'est le champ dont le site lui-même
+se sert pour afficher soit un lien cliquable (nbTicket > 0), soit une cloche
+"créer une alerte" (nbTicket == 0).
 
-On surveille la page de l'événement plutôt qu'une catégorie précise : les
-URLs de catégorie (/category/<id>/...) n'existent que quand des offres sont
-en ligne, et renvoient 404 le reste du temps.
+Anti-spam : on ne notifie qu'au passage de 0 (ou état inconnu) vers > 0.
+Tant que des places restent en ligne, on reste silencieux ; on re-notifiera
+si tout repart à 0 puis qu'une nouvelle place apparaît. Le compteur est
+conservé entre les runs dans `last_count.txt` via le cache GitHub Actions.
 
-Variables d'environnement attendues :
-- NTFY_TOPIC : le nom de ton topic ntfy.sh (obligatoire)
-- TARGET_URL : l'URL à surveiller (optionnel, valeur par défaut ci-dessous)
+Variables d'environnement :
+- NTFY_TOPIC  : nom du topic ntfy.sh (obligatoire pour recevoir la notif)
+- CATEGORY_ID : id de la catégorie surveillée (défaut : 8137 = CAMPING)
 """
 
-import hashlib
 import os
 import re
 import sys
+import unicodedata
 
 import requests
-from bs4 import BeautifulSoup
 
-DEFAULT_URL = "https://resell.seetickets.com/fete-de-lhumanite-2026/"
-
-TARGET_URL = os.environ.get("TARGET_URL", DEFAULT_URL)
+CATEGORY_ID = os.environ.get("CATEGORY_ID", "8137")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
-HASH_FILE = "last_hash.txt"
+
+API_URL = f"https://resell.seetickets.com/api/categories/{CATEGORY_ID}"
+SITE_URL = "https://resell.seetickets.com/fete-de-lhumanite-2026/"
+STATE_FILE = "last_count.txt"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    ),
+    "Accept": "application/json",
 }
 
 
-def fetch_page(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+def slugify(value: str) -> str:
+    """Reproduit le slug utilisé dans les URLs du site (accents retirés)."""
+    ascii_value = (
+        unicodedata.normalize("NFKD", value)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", ascii_value)).strip("-")
+
+
+def fetch_category() -> dict:
+    resp = requests.get(API_URL, headers=HEADERS, timeout=20)
     resp.raise_for_status()
-    return resp.text
+    return resp.json()
 
 
-def extract_relevant_text(html: str) -> str:
-    """Isole le contenu qui nous intéresse et enlève le bruit."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # On enlève les balises qui ne portent jamais d'info utile
-    for tag in soup(["script", "style", "noscript", "svg", "img"]):
-        tag.decompose()
-
-    text = soup.get_text(separator=" ", strip=True)
-
-    # On enlève les nombres qui pourraient être des timestamps/compteurs
-    # variables sans rapport avec la dispo (à ajuster si trop de faux positifs)
-    text = re.sub(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?", "", text)
-
-    return text
+def category_name(category: dict) -> str:
+    """Le nom est renvoyé par locale : {"en": "... - CAMPING"}."""
+    names = category.get("name") or {}
+    if isinstance(names, str):
+        return names
+    return next(iter(names.values()), "")
 
 
-def looks_like_ticket_available(text: str) -> bool:
-    """Heuristique simple : indices qu'une offre est présente."""
-    lowered = text.lower()
-    positive_signals = ["ajouter au panier", "acheter", "quantité"]
-    negative_signals = ["aucun billet", "aucune offre", "indisponible", "épuisé"]
+def check_is_camping(name: str):
+    """
+    Garde-fou : si l'id surveillé pointait un jour vers autre chose (les ids
+    sont réattribués d'une édition à l'autre), on préfère échouer bruyamment
+    plutôt que surveiller silencieusement la mauvaise catégorie.
+    "parking" est exclu explicitement à cause de PARKING CAMPEURS et
+    PARKING CAMPING-CAR, qui contiennent eux aussi "camping".
+    """
+    lowered = slugify(name)
+    if "camping" not in lowered or "parking" in lowered:
+        print(
+            f"La catégorie {CATEGORY_ID} s'appelle {name!r} : ce n'est pas le "
+            f"camping. Vérifie CATEGORY_ID.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    has_positive = any(s in lowered for s in positive_signals)
-    has_negative = any(s in lowered for s in negative_signals)
 
-    return has_positive and not has_negative
+def build_ticket_url(name: str) -> str:
+    """
+    Lien direct vers la catégorie. Cette page renvoie 404 tant qu'aucune
+    place n'est en vente, donc on vérifie avant de l'envoyer et on retombe
+    sur l'accueil du site si elle n'est pas encore ouverte.
+    """
+    url = f"{SITE_URL}category/{CATEGORY_ID}/{slugify(name)}"
+    try:
+        if requests.get(url, headers=HEADERS, timeout=10).status_code == 200:
+            return url
+    except requests.RequestException:
+        pass
+    return SITE_URL
 
 
-def send_notification(title: str, message: str, url: str):
+def send_notification(count: int, url: str):
     if not NTFY_TOPIC:
         print("NTFY_TOPIC non défini, notification non envoyée.")
         return
 
+    places = "place" if count == 1 else "places"
+    message = (
+        f"{count} {places} de camping en revente. Fonce, ça part vite !"
+    )
     requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         headers={
-            "Title": title.encode("utf-8"),
+            "Title": f"🏕️ Camping dispo ({count})".encode("utf-8"),
             "Click": url,
             "Priority": "high",
-            "Tags": "ticket",
+            "Tags": "tent",
         },
         timeout=10,
     )
 
 
-def load_previous_hash() -> str | None:
-    if os.path.exists(HASH_FILE):
-        with open(HASH_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return None
+def load_previous_count() -> int | None:
+    if not os.path.exists(STATE_FILE):
+        return None
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    try:
+        return int(content)
+    except ValueError:
+        # Fichier de cache corrompu ou hérité de l'ancienne version (hash) :
+        # on repart de zéro plutôt que de planter.
+        return None
 
 
-def save_hash(new_hash: str):
-    with open(HASH_FILE, "w", encoding="utf-8") as f:
-        f.write(new_hash)
+def save_count(count: int):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(str(count))
 
 
 def main():
     try:
-        html = fetch_page(TARGET_URL)
+        category = fetch_category()
     except requests.HTTPError as e:
-        # Un 404/410 veut dire que l'URL surveillée n'existe plus : le script
-        # ne peut plus rien détecter. On fait échouer le job pour que le run
-        # apparaisse en rouge dans l'onglet Actions (et déclenche le mail
-        # d'échec de GitHub) plutôt que de passer au vert sans rien faire.
-        print(f"URL surveillée injoignable ({e}). Vérifie TARGET_URL.", file=sys.stderr)
+        # L'API ne connaît plus cette catégorie : le script ne peut plus rien
+        # détecter. On fait échouer le job pour que le run passe au rouge
+        # dans l'onglet Actions plutôt que de rester vert sans rien faire.
+        print(f"Catégorie {CATEGORY_ID} injoignable ({e}).", file=sys.stderr)
         sys.exit(1)
-    except requests.RequestException as e:
-        # Timeout, coupure réseau, 5xx passager : on ne fait pas planter le job.
-        print(f"Erreur réseau ponctuelle : {e}", file=sys.stderr)
+    except (requests.RequestException, ValueError) as e:
+        # Timeout, coupure réseau, 5xx passager, JSON invalide : sans gravité.
+        print(f"Erreur ponctuelle : {e}", file=sys.stderr)
         sys.exit(0)
 
-    text = extract_relevant_text(html)
-    current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    name = category_name(category)
+    check_is_camping(name)
 
-    previous_hash = load_previous_hash()
+    count = category.get("nbTicket") or 0
+    previous = load_previous_count()
+    print(f"{name} : nbTicket={count} (précédent : {previous})")
 
-    if previous_hash is None:
-        # Premier run : on enregistre juste l'état de référence
-        print("Premier passage : enregistrement du hash de référence.")
-        save_hash(current_hash)
-        return
-
-    if current_hash != previous_hash:
-        print("Changement détecté sur la page !")
-        available = looks_like_ticket_available(text)
-        if available:
-            title = "🎫 Billet(s) probablement disponible(s) !"
-            message = "Un changement suggérant une offre a été détecté. Va vérifier vite !"
-        else:
-            title = "🔔 Changement détecté sur la page"
-            message = "Le contenu de la page a changé (pas sûr à 100% que ce soit un billet). Va vérifier."
-
-        send_notification(title, message, TARGET_URL)
-        save_hash(current_hash)
+    if count > 0 and not previous:
+        # `not previous` couvre 0 et None (premier run ou cache expiré) : on
+        # préfère une notif de trop qu'une place manquée.
+        print("Des places sont disponibles, envoi de la notification.")
+        send_notification(count, build_ticket_url(name))
+    elif count > 0:
+        print("Places toujours en ligne, déjà notifié.")
     else:
-        print("Aucun changement détecté.")
+        print("Aucune place de camping en revente.")
+
+    save_count(count)
 
 
 if __name__ == "__main__":

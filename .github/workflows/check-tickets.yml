@@ -25,15 +25,15 @@ jobs:
 
       # La clé doit être unique à chaque run : actions/cache ne ré-enregistre
       # PAS le cache quand la clé correspond exactement à un cache existant.
-      # Avec une clé fixe, last_hash.txt resterait figé sur la valeur du tout
-      # premier run, et on recevrait une notif à chaque exécution.
-      - name: Restaurer le hash précédent (cache)
+      # Avec une clé fixe, last_count.txt resterait figé sur la valeur du tout
+      # premier run, et on ne détecterait plus jamais de changement.
+      - name: Restaurer le compteur précédent (cache)
         uses: actions/cache@v4
         with:
-          path: last_hash.txt
-          key: ticket-hash-${{ github.run_id }}
+          path: last_count.txt
+          key: camping-count-${{ github.run_id }}
           restore-keys: |
-            ticket-hash-
+            camping-count-
 
       - name: Lancer la vérification
         env:
